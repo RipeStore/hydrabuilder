@@ -260,7 +260,7 @@ jobs:
 
       - name: Patch ExpoModulesJSI Swift/C++ interop bug
         run: |
-          python3 -c '
+          python3 - << 'PYEOF'
           import os
           path = "node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Coding/JavaScriptCodable+Date.swift"
           if os.path.exists(path):
@@ -275,21 +275,25 @@ jobs:
                   print("ℹ️ abs(milliseconds) already patched or not present")
           else:
               print("ℹ️ Path not found, skipping patch")
-          '
+          PYEOF
 
       - name: Strip Telemetry, Phone-Home & Unlock Pro
         run: |
-          python3 -c '
+          python3 - << 'PYEOF'
           import re, os
 
-          # 1. contexts/SubscriptionsContext.tsx (Unlock Pro, neuter RevenueCat)
+          # 1. contexts/SubscriptionsContext.tsx (Unlock Pro, kill grace period, neuter RevenueCat)
           path = "contexts/SubscriptionsContext.tsx"
           if os.path.exists(path):
               with open(path, "r") as f:
                   content = f.read()
               content = content.replace("isPro: false,", "isPro: true,")
+              content = content.replace("purchasesInitialized: false,", "purchasesInitialized: true,")
               content = content.replace("isLoadingProductsAndOfferings: true,", "isLoadingProductsAndOfferings: false,")
+              content = content.replace("inGracePeriod: false,", "inGracePeriod: false,")
               content = re.sub(r"const isPro =[\s\S]*?;", "const isPro = true;", content)
+              content = re.sub(r"const inGracePeriod =[\s\S]*?;", "const inGracePeriod = false;", content)
+              content = re.sub(r"const gracePeriodEndsAt =[\s\S]*?;", "const gracePeriodEndsAt = null;", content)
               content = re.sub(r"Purchases\.configure\(\{[\s\S]*?\}\);", "// Purchases.configure disabled", content)
               content = re.sub(r"const loadHydraProOffering = async \(\) => \{[\s\S]*?\n  \};", "const loadHydraProOffering = async () => null;", content)
               content = re.sub(r"const loadTipProducts = async \(\) => \{[\s\S]*?\n  \};", "const loadTipProducts = async () => [];", content)
@@ -299,9 +303,86 @@ jobs:
               content = content.replace("registerCustomer({\n        customerId: customerInfo.originalAppUserId,\n      });", "// registerCustomer disabled")
               with open(path, "w") as f:
                   f.write(content)
-              print("✅ Patched SubscriptionsContext.tsx (Pro unlocked, RevenueCat disabled)")
+              print("✅ Patched SubscriptionsContext.tsx (Pro unlocked, inGracePeriod false, RevenueCat disabled)")
 
-          # 2. app/index.tsx (Disable Sentry crash/telemetry tracking)
+          # 2. utils/RedditCookies.ts (Use MMKV KeyStore with safe SecureStore fallback for sideloaded persistence)
+          path = "utils/RedditCookies.ts"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  rc = f.read()
+              if "import KeyStore from" not in rc:
+                  rc = 'import KeyStore from "./KeyStore";\n' + rc
+              s1 = "await SecureStore.setItemAsync(\n        `redditSession-${username}`,\n        JSON.stringify(cookies.reddit_session),\n      );"
+              r1 = "const val = JSON.stringify(cookies.reddit_session);\n      KeyStore.set(`redditSession-${username}`, val);\n      try { await SecureStore.setItemAsync(`redditSession-${username}`, val); } catch (_) {}"
+              if s1 in rc:
+                  rc = rc.replace(s1, r1)
+              s2 = "const redditSession = await SecureStore.getItemAsync(\n      `redditSession-${username}`,\n    );"
+              r2 = "let redditSession = KeyStore.getString(`redditSession-${username}`);\n    if (!redditSession) { try { redditSession = await SecureStore.getItemAsync(`redditSession-${username}`); } catch (_) {} }"
+              if s2 in rc:
+                  rc = rc.replace(s2, r2)
+              s3 = "await CookieManager.set(\n        \"https://www.reddit.com\",\n        JSON.parse(redditSession),\n      );"
+              r3 = "const c = JSON.parse(redditSession);\n      await CookieManager.set(\"https://www.reddit.com\", c);\n      await CookieManager.set(\"https://www.reddit.com\", c, true);\n      await CookieManager.set(\"https://old.reddit.com\", c);\n      await CookieManager.set(\"https://old.reddit.com\", c, true);"
+              if s3 in rc:
+                  rc = rc.replace(s3, r3)
+              s4 = "await SecureStore.deleteItemAsync(`redditSession-${username}`);"
+              r4 = "KeyStore.remove(`redditSession-${username}`);\n    try { await SecureStore.deleteItemAsync(`redditSession-${username}`); } catch (_) {}"
+              if s4 in rc:
+                  rc = rc.replace(s4, r4)
+              s5 = "static async persistSessionCookies() {"
+              r5 = "static async persistSessionCookies() {\n    try {"
+              if s5 in rc:
+                  rc = rc.replace(s5, r5)
+              s6 = "await CookieManager.set(\"https://www.reddit.com\", newCookies);\n    }\n  }"
+              r6 = "await CookieManager.set(\"https://www.reddit.com\", newCookies);\n      await CookieManager.set(\"https://www.reddit.com\", newCookies, true);\n    }\n    } catch (_) {}\n  }"
+              if s6 in rc:
+                  rc = rc.replace(s6, r6)
+              with open(path, "w") as f:
+                  f.write(rc)
+              print("✅ Patched RedditCookies.ts (MMKV session storage, Keychain error immunity)")
+
+          # 3. contexts/AccountContext.tsx (Wrap fixIncompatibleAccountSettings in try/catch to prevent logout)
+          path = "contexts/AccountContext.tsx"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  acc = f.read()
+              acc = acc.replace("Sentry.setUser({ username: user.userName });", "// Sentry.setUser disabled")
+              acc = acc.replace("Sentry.setUser(null);", "// Sentry.setUser disabled")
+              s_fix = "await fixIncompatibleAccountSettings();"
+              r_fix = "try {\n        await fixIncompatibleAccountSettings();\n      } catch (e) {\n        console.warn(\"Non-fatal error in fixIncompatibleAccountSettings:\", e);\n      }"
+              if s_fix in acc:
+                  acc = acc.replace(s_fix, r_fix)
+              with open(path, "w") as f:
+                  f.write(acc)
+              print("✅ Patched AccountContext.tsx (fixIncompatibleAccountSettings made non-fatal)")
+
+          # 4. components/UI/GetHydraProButton.tsx (Hide GetHydraProButton when isPro)
+          path = "components/UI/GetHydraProButton.tsx"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  gpb = f.read()
+              if "import { SubscriptionsContext }" not in gpb:
+                  gpb = "import { SubscriptionsContext } from \"../../contexts/SubscriptionsContext\";\n" + gpb
+              s_btn = "export default function GetHydraProButton({ onPress }: GetHydraProButtonProps) {\n  const { theme } = useContext(ThemeContext);"
+              r_btn = "export default function GetHydraProButton({ onPress }: GetHydraProButtonProps) {\n  const { theme } = useContext(ThemeContext);\n  const { isPro } = useContext(SubscriptionsContext);\n  if (isPro) return null;"
+              if s_btn in gpb:
+                  gpb = gpb.replace(s_btn, r_btn)
+              with open(path, "w") as f:
+                  f.write(gpb)
+              print("✅ Patched GetHydraProButton.tsx (Hidden when Pro)")
+
+          # 5. pages/SettingsPage/HydraPro.tsx (Clean UI when isPro is true)
+          path = "pages/SettingsPage/HydraPro.tsx"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  hp = f.read()
+              hp = hp.replace("Unlock the full potential of Hydra", "{isPro ? \"Hydra Pro Active - All features unlocked\" : \"Unlock the full potential of Hydra\"}")
+              hp = hp.replace("\"Manage Subscription\"", "\"Hydra Pro Active\"")
+              hp = hp.replace("disabled={isLoadingProductsAndOfferings || !purchasesInitialized}", "disabled={isPro || isLoadingProductsAndOfferings || !purchasesInitialized}")
+              with open(path, "w") as f:
+                  f.write(hp)
+              print("✅ Patched HydraPro.tsx (Pro Active button & banner)")
+
+          # 6. app/index.tsx (Disable Sentry crash/telemetry tracking)
           path = "app/index.tsx"
           if os.path.exists(path):
               with open(path, "r") as f:
@@ -312,18 +393,7 @@ jobs:
                   f.write(content)
               print("✅ Patched app/index.tsx (Sentry tracking disabled)")
 
-          # 3. contexts/AccountContext.tsx (Do not send username to Sentry)
-          path = "contexts/AccountContext.tsx"
-          if os.path.exists(path):
-              with open(path, "r") as f:
-                  content = f.read()
-              content = content.replace("Sentry.setUser({ username: user.userName });", "// Sentry.setUser disabled")
-              content = content.replace("Sentry.setUser(null);", "// Sentry.setUser disabled")
-              with open(path, "w") as f:
-                  f.write(content)
-              print("✅ Patched AccountContext.tsx (Sentry username tracking stripped)")
-
-          # 4. pages/SettingsPage/Privacy.tsx (Default error reporting to false)
+          # 7. pages/SettingsPage/Privacy.tsx (Default error reporting to false)
           path = "pages/SettingsPage/Privacy.tsx"
           if os.path.exists(path):
               with open(path, "r") as f:
@@ -333,7 +403,7 @@ jobs:
                   f.write(content)
               print("✅ Patched Privacy.tsx (Error reporting defaults to false)")
 
-          # 5. api/Customer.ts (Disable customer registration with hydra backend)
+          # 8. api/Customer.ts (Disable customer registration with hydra backend)
           path = "api/Customer.ts"
           if os.path.exists(path):
               with open(path, "r") as f:
@@ -343,7 +413,7 @@ jobs:
                   f.write(content)
               print("✅ Patched api/Customer.ts (Hydra server customer tracking disabled)")
 
-          # 6. api/Notifications.ts (Do not transmit account sessions to hydra server)
+          # 9. api/Notifications.ts (Do not transmit account sessions to hydra server)
           path = "api/Notifications.ts"
           if os.path.exists(path):
               with open(path, "r") as f:
@@ -353,7 +423,7 @@ jobs:
                   f.write(content)
               print("✅ Patched api/Notifications.ts (Session transmission disabled)")
 
-          # 7. app.config.ts (Disable Expo OTA updates phone-home)
+          # 10. app.config.ts (Disable Expo OTA updates phone-home)
           path = "app.config.ts"
           if os.path.exists(path):
               with open(path, "r") as f:
@@ -363,7 +433,7 @@ jobs:
                   f.write(content)
               print("✅ Patched app.config.ts (Expo OTA updates disabled)")
 
-          # 8. Disable AI summaries by default in PostSettingsContext & CommentSettingsContext
+          # 11. Disable AI summaries by default in PostSettingsContext & CommentSettingsContext
           path = "contexts/SettingsContexts/PostSettingsContext.tsx"
           if os.path.exists(path):
               with open(path, "r") as f:
@@ -381,7 +451,56 @@ jobs:
               with open(path, "w") as f:
                   f.write(content)
               print("✅ Patched CommentSettingsContext.tsx (AI comment summary disabled by default)")
-          '
+
+          # 12. api/AI.ts (Completely stub all AI calls so no requests reach api.hydraapp.io)
+          path = "api/AI.ts"
+          if os.path.exists(path):
+              ai_stub = (
+                  "import { PostDetail } from \"./PostDetail\";\n"
+                  "import { Post } from \"./Posts\";\n\n"
+                  "export async function summarizePostDetails(customerId: string, post: PostDetail): Promise<string> {\n"
+                  "  throw new Error(\"AI disabled\");\n"
+                  "}\n\n"
+                  "export async function summarizePostComments(customerId: string, post: PostDetail, postSummary: string): Promise<string> {\n"
+                  "  throw new Error(\"AI disabled\");\n"
+                  "}\n\n"
+                  "export async function filterPosts(customerId: string, filterDescription: string, posts: Post[]): Promise<Record<Post[\"id\"], boolean>> {\n"
+                  "  return {};\n"
+                  "}\n\n"
+                  "export async function getEmbedding(text: string): Promise<number[]> {\n"
+                  "  return [];\n"
+                  "}\n\n"
+                  "export async function askQuestion(question: string, docs: string[]): Promise<{ markdown: string }> {\n"
+                  "  return { markdown: \"\" };\n"
+                  "}\n"
+              )
+              with open(path, "w") as f:
+                  f.write(ai_stub)
+              print("✅ Patched api/AI.ts (Zero traffic to hydraapp.io)")
+
+          # 13. utils/DocumentationSearch.ts (Prevent crash when getEmbedding returns empty)
+          path = "utils/DocumentationSearch.ts"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  ds = f.read()
+              s_ds = "async find(query: string, k: number) {\n    const queryVector = await getEmbedding(query);\n    const results = this.findNearest(queryVector, k);\n    return results.map((result) => result.id);\n  }"
+              r_ds = "async find(query: string, k: number) {\n    const queryVector = await getEmbedding(query);\n    if (!queryVector || queryVector.length === 0) return [];\n    const results = this.findNearest(queryVector, k);\n    return results.map((result) => result.id);\n  }"
+              if s_ds in ds:
+                  ds = ds.replace(s_ds, r_ds)
+                  with open(path, "w") as f:
+                      f.write(ds)
+                  print("✅ Patched DocumentationSearch.ts (Empty embedding safety check)")
+
+          # 14. constants/HydraServer.ts (Redirect default hydra backend URL to loopback)
+          path = "constants/HydraServer.ts"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  hs = f.read()
+              hs = hs.replace('export const DEFAULT_HYDRA_SERVER_URL = "https://api.hydraapp.io";', 'export const DEFAULT_HYDRA_SERVER_URL = "http://127.0.0.1";')
+              with open(path, "w") as f:
+                  f.write(hs)
+              print("✅ Patched constants/HydraServer.ts (Default backend redirected to 127.0.0.1)")
+          PYEOF
 
       - name: Generate native iOS project (expo prebuild)
         run: npx expo prebuild --platform ios --no-install --clean
