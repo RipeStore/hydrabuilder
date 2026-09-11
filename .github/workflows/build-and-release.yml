@@ -258,6 +258,25 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Patch ExpoModulesJSI Swift/C++ interop bug
+        run: |
+          python3 -c '
+          import os
+          path = "node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Coding/JavaScriptCodable+Date.swift"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  content = f.read()
+              if "abs(milliseconds)" in content:
+                  content = content.replace("abs(milliseconds)", "Swift.abs(milliseconds)")
+                  with open(path, "w") as f:
+                      f.write(content)
+                  print("✅ Successfully patched JavaScriptCodable+Date.swift (abs -> Swift.abs)")
+              else:
+                  print("ℹ️ abs(milliseconds) already patched or not present")
+          else:
+              print("ℹ️ Path not found, skipping patch")
+          '
+
       - name: Generate native iOS project (expo prebuild)
         run: npx expo prebuild --platform ios --no-install --clean
 
