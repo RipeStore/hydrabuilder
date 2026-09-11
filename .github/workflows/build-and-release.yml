@@ -277,6 +277,112 @@ jobs:
               print("ℹ️ Path not found, skipping patch")
           '
 
+      - name: Strip Telemetry, Phone-Home & Unlock Pro
+        run: |
+          python3 -c '
+          import re, os
+
+          # 1. contexts/SubscriptionsContext.tsx (Unlock Pro, neuter RevenueCat)
+          path = "contexts/SubscriptionsContext.tsx"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  content = f.read()
+              content = content.replace("isPro: false,", "isPro: true,")
+              content = content.replace("isLoadingProductsAndOfferings: true,", "isLoadingProductsAndOfferings: false,")
+              content = re.sub(r"const isPro =[\s\S]*?;", "const isPro = true;", content)
+              content = re.sub(r"Purchases\.configure\(\{[\s\S]*?\}\);", "// Purchases.configure disabled", content)
+              content = re.sub(r"const loadHydraProOffering = async \(\) => \{[\s\S]*?\n  \};", "const loadHydraProOffering = async () => null;", content)
+              content = re.sub(r"const loadTipProducts = async \(\) => \{[\s\S]*?\n  \};", "const loadTipProducts = async () => [];", content)
+              content = re.sub(r"const getCustomerInfo = async \([\s\S]*?\n  \};", "const getCustomerInfo = async (_refresh = false) => { setPurchasesInitialized(true); };", content)
+              content = content.replace("Purchases.addCustomerInfoUpdateListener(handleCustomerInfoUpdate);", "// listener disabled")
+              content = content.replace("Purchases.removeCustomerInfoUpdateListener(handleCustomerInfoUpdate);", "// listener disabled")
+              content = content.replace("registerCustomer({\n        customerId: customerInfo.originalAppUserId,\n      });", "// registerCustomer disabled")
+              with open(path, "w") as f:
+                  f.write(content)
+              print("✅ Patched SubscriptionsContext.tsx (Pro unlocked, RevenueCat disabled)")
+
+          # 2. app/index.tsx (Disable Sentry crash/telemetry tracking)
+          path = "app/index.tsx"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  content = f.read()
+              content = re.sub(r"dsn:\s*\"[^\"]*\",", "dsn: \"\",", content)
+              content = content.replace("enabled: !__DEV__ && reportingAllowed,", "enabled: false,")
+              with open(path, "w") as f:
+                  f.write(content)
+              print("✅ Patched app/index.tsx (Sentry tracking disabled)")
+
+          # 3. contexts/AccountContext.tsx (Do not send username to Sentry)
+          path = "contexts/AccountContext.tsx"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  content = f.read()
+              content = content.replace("Sentry.setUser({ username: user.userName });", "// Sentry.setUser disabled")
+              content = content.replace("Sentry.setUser(null);", "// Sentry.setUser disabled")
+              with open(path, "w") as f:
+                  f.write(content)
+              print("✅ Patched AccountContext.tsx (Sentry username tracking stripped)")
+
+          # 4. pages/SettingsPage/Privacy.tsx (Default error reporting to false)
+          path = "pages/SettingsPage/Privacy.tsx"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  content = f.read()
+              content = content.replace("storedAllowErrorReporting ?? true", "storedAllowErrorReporting ?? false")
+              with open(path, "w") as f:
+                  f.write(content)
+              print("✅ Patched Privacy.tsx (Error reporting defaults to false)")
+
+          # 5. api/Customer.ts (Disable customer registration with hydra backend)
+          path = "api/Customer.ts"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  content = f.read()
+              content = re.sub(r"export async function registerCustomer[\s\S]*?^}", "export async function registerCustomer(customer: any) {\n  return;\n}", content, flags=re.MULTILINE)
+              with open(path, "w") as f:
+                  f.write(content)
+              print("✅ Patched api/Customer.ts (Hydra server customer tracking disabled)")
+
+          # 6. api/Notifications.ts (Do not transmit account sessions to hydra server)
+          path = "api/Notifications.ts"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  content = f.read()
+              content = re.sub(r"export async function registerNotifications[\s\S]*?^}", "export async function registerNotifications(...args: any[]) {\n  return;\n}", content, flags=re.MULTILINE)
+              with open(path, "w") as f:
+                  f.write(content)
+              print("✅ Patched api/Notifications.ts (Session transmission disabled)")
+
+          # 7. app.config.ts (Disable Expo OTA updates phone-home)
+          path = "app.config.ts"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  content = f.read()
+              content = re.sub(r"updates:\s*\{[\s\S]*?\},", "updates: {\n      enabled: false,\n      checkAutomatically: \"NEVER\",\n    },", content)
+              with open(path, "w") as f:
+                  f.write(content)
+              print("✅ Patched app.config.ts (Expo OTA updates disabled)")
+
+          # 8. Disable AI summaries by default in PostSettingsContext & CommentSettingsContext
+          path = "contexts/SettingsContexts/PostSettingsContext.tsx"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  content = f.read()
+              content = content.replace("showPostSummary: true,", "showPostSummary: false,")
+              with open(path, "w") as f:
+                  f.write(content)
+              print("✅ Patched PostSettingsContext.tsx (AI summary disabled by default)")
+
+          path = "contexts/SettingsContexts/CommentSettingsContext.tsx"
+          if os.path.exists(path):
+              with open(path, "r") as f:
+                  content = f.read()
+              content = content.replace("showCommentSummary: true,", "showCommentSummary: false,")
+              with open(path, "w") as f:
+                  f.write(content)
+              print("✅ Patched CommentSettingsContext.tsx (AI comment summary disabled by default)")
+          '
+
       - name: Generate native iOS project (expo prebuild)
         run: npx expo prebuild --platform ios --no-install --clean
 
