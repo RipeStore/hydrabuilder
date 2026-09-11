@@ -1,0 +1,481 @@
+name: Build & Release Hydra iOS IPA
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'
+
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Upstream Branch, Commit SHA, or Tag to build (leave empty for latest upstream master HEAD)'
+        required: false
+        type: string
+        default: ''
+      force_rebuild:
+        description: 'Force build & overwrite release even if it already exists'
+        required: false
+        type: boolean
+        default: false
+      is_prerelease:
+        description: 'Mark published release as Pre-release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-upstream:
+    name: Resolve Target & Check Existing
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.resolve.outputs.should_build }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      commit_sha: ${{ steps.resolve.outputs.commit_sha }}
+      short_sha: ${{ steps.resolve.outputs.short_sha }}
+      app_version: ${{ steps.resolve.outputs.app_version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      release_notes: ${{ steps.resolve.outputs.release_notes }}
+      store_version: ${{ steps.resolve.outputs.store_version }}
+      changes_since_release: ${{ steps.resolve.outputs.changes_since_release }}
+    steps:
+      - name: Resolve target commit & compare
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TARGET: ${{ inputs.target }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild || 'false' }}
+          IS_PRERELEASE: ${{ inputs.is_prerelease || 'false' }}
+        run: |
+          set -euo pipefail
+
+          python3 - << 'PYEOF'
+          import os, sys, json, re, urllib.request, base64
+
+          upstream_repo = "dmilin1/hydra"
+          current_repo = os.environ.get("GITHUB_REPOSITORY", "")
+          input_target = os.environ.get("INPUT_TARGET", "").strip()
+          force_rebuild = os.environ.get("FORCE_REBUILD", "false").lower() == "true"
+          is_prerelease = os.environ.get("IS_PRERELEASE", "false").lower() == "true"
+          gh_token = os.environ.get("GH_TOKEN", "")
+
+          headers = {"User-Agent": "Mozilla/5.0"}
+          if gh_token:
+              headers["Authorization"] = f"token {gh_token}"
+              headers["Accept"] = "application/vnd.github+json"
+
+          commit_sha = ""
+          app_version = ""
+          target_source = ""
+          store_release_notes = ""
+          store_ver = ""
+          store_date = ""
+          changes_since_release = ""
+
+          if input_target:
+              print(f"🎯 Manual target requested: {input_target}")
+              try:
+                  url = f"https://api.github.com/repos/{upstream_repo}/commits/{input_target}"
+                  req = urllib.request.Request(url, headers=headers)
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      data = json.loads(resp.read().decode("utf-8"))
+                      commit_sha = data.get("sha", "")
+                      target_source = f"manual-{input_target}"
+              except Exception as e:
+                  print(f"⚠️ Could not resolve target via direct commit API: {e}")
+                  commit_sha = input_target
+                  target_source = "manual"
+          else:
+              print(f"🔍 Auto-detecting latest upstream master HEAD for {upstream_repo}...")
+              try:
+                  url = f"https://api.github.com/repos/{upstream_repo}/commits/master"
+                  req = urllib.request.Request(url, headers=headers)
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      data = json.loads(resp.read().decode("utf-8"))
+                      commit_sha = data.get("sha", "")
+                      target_source = "master-head"
+                      print(f"✅ Resolved master HEAD: {commit_sha}")
+              except Exception as e:
+                  print(f"❌ Failed to resolve master HEAD: {e}")
+                  sys.exit(1)
+
+              # Query Apple App Store API for latest metadata & notes
+              app_id = "6478089063"
+              try:
+                  store_url = f"https://itunes.apple.com/lookup?id={app_id}"
+                  s_req = urllib.request.Request(store_url, headers=headers)
+                  with urllib.request.urlopen(s_req, timeout=10) as s_resp:
+                      store_data = json.loads(s_resp.read().decode("utf-8"))
+                      if store_data.get("resultCount", 0) > 0:
+                          entry = store_data["results"][0]
+                          store_release_notes = entry.get("releaseNotes", "")
+                          store_ver = entry.get("version", "")
+                          store_date = entry.get("currentVersionReleaseDate", "")
+                          print(f"📱 Apple App Store version: {store_ver} (released {store_date})")
+              except Exception as e:
+                  print(f"ℹ️ App Store lookup skipped: {e}")
+
+              # Correlate App Store version with git commit history
+              if store_ver:
+                  try:
+                      commits_url = f"https://api.github.com/repos/{upstream_repo}/commits?path=package.json&per_page=15"
+                      req_c = urllib.request.Request(commits_url, headers=headers)
+                      with urllib.request.urlopen(req_c, timeout=10) as resp_c:
+                          pkg_commits = json.loads(resp_c.read().decode("utf-8"))
+
+                      store_bump_commit = None
+                      for pc in pkg_commits:
+                          pc_sha = pc["sha"]
+                          p_url = f"https://api.github.com/repos/{upstream_repo}/contents/package.json?ref={pc_sha}"
+                          req_p = urllib.request.Request(p_url, headers=headers)
+                          with urllib.request.urlopen(req_p, timeout=10) as resp_p:
+                              content = json.loads(resp_p.read().decode("utf-8")).get("content", "")
+                              v = json.loads(base64.b64decode(content).decode("utf-8")).get("version", "")
+                              if v == store_ver:
+                                  store_bump_commit = pc_sha
+                              elif store_bump_commit is not None:
+                                  break
+
+                      if store_bump_commit:
+                          print(f"🎯 Correlated App Store {store_ver} release commit: {store_bump_commit[:7]}")
+                          if store_bump_commit != commit_sha:
+                              comp_url = f"https://api.github.com/repos/{upstream_repo}/compare/{store_bump_commit}...{commit_sha}"
+                              req_cmp = urllib.request.Request(comp_url, headers=headers)
+                              with urllib.request.urlopen(req_cmp, timeout=10) as resp_cmp:
+                                  comp_data = json.loads(resp_cmp.read().decode("utf-8"))
+                                  ahead_commits = [
+                                      f"- `{c['sha'][:7]}` {c['commit']['message'].splitlines()[0]}"
+                                      for c in comp_data.get("commits", [])
+                                  ]
+                                  if ahead_commits:
+                                      changes_since_release = "\n".join(ahead_commits)
+                                      print(f"🚀 Found {len(ahead_commits)} commits ahead of App Store release:\n{changes_since_release}")
+                          else:
+                              print("✅ HEAD is at the exact commit of the App Store release.")
+                  except Exception as e:
+                      print(f"ℹ️ Correlation skipped: {e}")
+
+          if not commit_sha:
+              print("❌ Could not determine commit SHA.")
+              sys.exit(1)
+
+          short_sha = commit_sha[:7]
+
+          # Extract app version from package.json at this commit
+          try:
+              pkg_url = f"https://api.github.com/repos/{upstream_repo}/contents/package.json?ref={commit_sha}"
+              p_req = urllib.request.Request(pkg_url, headers=headers)
+              with urllib.request.urlopen(p_req, timeout=15) as p_resp:
+                  raw_content = base64.b64decode(json.loads(p_resp.read().decode("utf-8")).get("content", "")).decode("utf-8")
+                  pkg_json = json.loads(raw_content)
+                  app_version = pkg_json.get("version", "")
+                  print(f"📦 package.json version: {app_version}")
+          except Exception as e:
+              print(f"⚠️ Failed to parse package.json: {e}")
+
+          if not app_version:
+              app_version = store_ver or "4.2.2"
+
+          tag_name = f"v{app_version}-{short_sha}"
+          print(f"🏷️ Release Tag: {tag_name} (Version: {app_version}, SHA: {short_sha})")
+
+          # Check if already released
+          exists_in_repo = False
+          if current_repo:
+              try:
+                  check_url = f"https://api.github.com/repos/{current_repo}/releases/tags/{tag_name}"
+                  c_req = urllib.request.Request(check_url, headers=headers)
+                  with urllib.request.urlopen(c_req, timeout=10) as c_resp:
+                      if c_resp.status == 200:
+                          exists_in_repo = True
+                          print(f"ℹ️ Found existing release for tag {tag_name}")
+              except Exception:
+                  pass
+
+              if not exists_in_repo:
+                  try:
+                      list_url = f"https://api.github.com/repos/{current_repo}/releases?per_page=100"
+                      l_req = urllib.request.Request(list_url, headers=headers)
+                      with urllib.request.urlopen(l_req, timeout=10) as l_resp:
+                          rel_list = json.loads(l_resp.read().decode("utf-8"))
+                          for r in rel_list:
+                              if short_sha in r.get("tag_name", ""):
+                                  exists_in_repo = True
+                                  print(f"ℹ️ Found existing release with commit SHA {short_sha}: {r.get('tag_name')}")
+                                  break
+                  except Exception:
+                      pass
+
+          if exists_in_repo and not force_rebuild:
+              print(f"✅ Target {tag_name} already built and released. Skipping.")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("should_build=false\n")
+              sys.exit(0)
+
+          print(f"🚀 Ready to build target: {tag_name} ({target_source})")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("should_build=true\n")
+              f.write(f"tag={tag_name}\n")
+              f.write(f"commit_sha={commit_sha}\n")
+              f.write(f"short_sha={short_sha}\n")
+              f.write(f"app_version={app_version}\n")
+              f.write(f"prerelease={str(is_prerelease).lower()}\n")
+              f.write(f"store_version={store_ver}\n")
+              if store_release_notes:
+                  f.write(f"release_notes<<EOF\n{store_release_notes}\nEOF\n")
+              else:
+                  f.write("release_notes=\n")
+              if changes_since_release:
+                  f.write(f"changes_since_release<<EOF\n{changes_since_release}\nEOF\n")
+              else:
+                  f.write("changes_since_release=\n")
+          PYEOF
+
+  build-ipa:
+    name: Build Unsigned iOS IPA
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      NSUnbufferedIO: "YES"
+      GIT_TERMINAL_PROMPT: "0"
+      NODE_VERSION: "20"
+    steps:
+      - name: Checkout Hydra (${{ needs.check-upstream.outputs.short_sha }})
+        uses: actions/checkout@v4
+        with:
+          repository: dmilin1/hydra
+          ref: ${{ needs.check-upstream.outputs.commit_sha }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate native iOS project (expo prebuild)
+        run: npx expo prebuild --platform ios --no-install --clean
+
+      - name: Configure Xcode Node environment (.xcode.env.local & Sentry bypass)
+        run: |
+          NODE_BIN=$(which node)
+          echo "Node binary: $NODE_BIN"
+          {
+            echo "export NODE_BINARY=\"$NODE_BIN\""
+            echo "export PATH=\"$(dirname "$NODE_BIN"):\$PATH\""
+            echo "export SENTRY_DISABLE_AUTO_UPLOAD=true"
+            echo "export SENTRY_ALLOW_FAILURE=true"
+            echo "export SENTRY_DRY_RUN=true"
+            echo "export CI=1"
+          } > ios/.xcode.env.local
+          cat ios/.xcode.env.local
+
+          # Disable Sentry sourcemap upload in properties files
+          echo "upload_sourcemaps=false" >> ios/sentry.properties 2>/dev/null || true
+          echo "upload_sourcemaps=false" >> sentry.properties 2>/dev/null || true
+
+      - name: Install CocoaPods dependencies
+        working-directory: ios
+        run: pod install
+
+      - name: Select Xcode & Accept License
+        run: |
+          XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)
+          if [ -z "$XCODE_APP" ]; then
+            XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode*.app" | sort -V | tail -n 1)
+          fi
+          echo "Selected Xcode: $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcodebuild -license accept
+          xcodebuild -version
+
+          # Skip macro/plugin trust prompts
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
+
+      - name: Skip code signing & build .app
+        timeout-minutes: 30
+        working-directory: ios
+        env:
+          SENTRY_DISABLE_AUTO_UPLOAD: "true"
+          SENTRY_ALLOW_FAILURE: "true"
+          SENTRY_DRY_RUN: "true"
+        run: |
+          set -euo pipefail
+
+          WORKSPACE=$(find . -maxdepth 1 -name "*.xcworkspace" | head -1)
+          if [ -z "$WORKSPACE" ]; then
+            echo "❌ No .xcworkspace found. Contents:"
+            ls -la
+            exit 1
+          fi
+          echo "Using workspace: $WORKSPACE"
+
+          APP_NAME=$(basename "$WORKSPACE" .xcworkspace)
+          SCHEME="$APP_NAME"
+          echo "Using scheme: $SCHEME"
+
+          # Build unsigned .app for generic iOS device
+          xcodebuild build \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$PWD/build" \
+            SENTRY_DISABLE_AUTO_UPLOAD=true \
+            SENTRY_ALLOW_FAILURE=true \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            -skipMacroValidation \
+            | (command -v xcbeautify >/dev/null 2>&1 && xcbeautify || cat)
+
+          echo "✅ Build completed"
+
+      - name: Package Unsigned IPA
+        env:
+          TAG: ${{ needs.check-upstream.outputs.tag }}
+        working-directory: ios
+        run: |
+          set -euo pipefail
+
+          IPA_NAME="Hydra-${TAG}-unsigned.ipa"
+
+          echo "📦 Locating .app bundle..."
+
+          APP_PATH=$(find "$PWD/build" \
+            -path "*/Build/Products/Release-iphoneos/*.app" \
+            -not -path "*/PlugIns/*" \
+            -maxdepth 7 2>/dev/null | head -n 1)
+
+          if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+            echo "⚠️ Trying broader search..."
+            APP_PATH=$(find "$PWD/build" \
+              -name "*.app" -type d \
+              -not -path "*/PlugIns/*" \
+              -not -path "*Intermediates*" 2>/dev/null | head -n 1)
+          fi
+
+          if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+            echo "❌ Failed to find .app. Build contents:"
+            find "$PWD/build" -name "*.app" -type d 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Found: $APP_PATH"
+
+          # Strip code signatures for clean unsigned IPA
+          codesign --remove-signature "${APP_PATH}" 2>/dev/null || true
+          find "${APP_PATH}" \( -name "*.dylib" -o -name "*.framework" -o -name "*.appex" \) -print0 | \
+            while IFS= read -r -d '' f; do
+              codesign --remove-signature "$f" 2>/dev/null || true
+            done
+
+          # Package into IPA
+          PAYLOAD_DIR="payload_staging/Payload"
+          mkdir -p "${PAYLOAD_DIR}"
+          cp -R "${APP_PATH}" "${PAYLOAD_DIR}/"
+
+          IPA_DEST="${GITHUB_WORKSPACE}/${IPA_NAME}"
+          cd payload_staging
+          zip -q -r -y "${IPA_DEST}" Payload
+          cd ..
+
+          ls -lh "${IPA_DEST}"
+          echo "🎉 Done: ${IPA_NAME}"
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: Hydra-*.ipa
+          retention-days: 3
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [check-upstream, build-ipa]
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download IPA artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ios-ipa
+          merge-multiple: true
+
+      - name: Compose Release Notes & Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-upstream.outputs.tag }}
+          SHORT_SHA: ${{ needs.check-upstream.outputs.short_sha }}
+          COMMIT_SHA: ${{ needs.check-upstream.outputs.commit_sha }}
+          APP_VERSION: ${{ needs.check-upstream.outputs.app_version }}
+          IS_PRERELEASE: ${{ needs.check-upstream.outputs.prerelease }}
+          STORE_NOTES: ${{ needs.check-upstream.outputs.release_notes }}
+          STORE_VERSION: ${{ needs.check-upstream.outputs.store_version }}
+          CHANGES_SINCE_RELEASE: ${{ needs.check-upstream.outputs.changes_since_release }}
+        run: |
+          set -euo pipefail
+
+          UPSTREAM_REPO="dmilin1/hydra"
+          RELEASE_TITLE="Hydra v${APP_VERSION} (${SHORT_SHA})"
+
+          COMMIT_MSG=$(gh api "repos/$UPSTREAM_REPO/commits/$COMMIT_SHA" --jq '.commit.message // empty' 2>/dev/null || true)
+
+          cat > release_notes.md << EOF
+          ## What's Changed in Upstream Hydra
+
+          Built from upstream commit [\`${SHORT_SHA}\`](https://github.com/${UPSTREAM_REPO}/commit/${COMMIT_SHA}) on \`master\`.
+
+          EOF
+
+          if [ -n "$COMMIT_MSG" ]; then
+            cat >> release_notes.md << EOF
+          ### Latest Commit Message:
+          \`\`\`
+          $COMMIT_MSG
+          \`\`\`
+
+          EOF
+          fi
+
+          if [ -n "$CHANGES_SINCE_RELEASE" ]; then
+            cat >> release_notes.md << EOF
+          ### 🔄 Commits Since App Store Release (v${STORE_VERSION}):
+          $CHANGES_SINCE_RELEASE
+
+          EOF
+          fi
+
+          if [ -n "$STORE_NOTES" ]; then
+            cat >> release_notes.md << EOF
+          ### App Store Release Notes (v${STORE_VERSION}):
+          $STORE_NOTES
+
+          EOF
+          fi
+
+
+          echo "🚀 Publishing Release '$TAG' with title '$RELEASE_TITLE'..."
+
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+
+          EXTRA_FLAGS=()
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            EXTRA_FLAGS+=("--prerelease")
+          fi
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$RELEASE_TITLE" \
+            --notes-file release_notes.md \
+            "${EXTRA_FLAGS[@]}" \
+            *.ipa
