@@ -241,7 +241,7 @@ jobs:
     env:
       NSUnbufferedIO: "YES"
       GIT_TERMINAL_PROMPT: "0"
-      NODE_VERSION: "20"
+      NODE_VERSION: "24"
     steps:
       - name: Checkout Hydra (${{ needs.check-upstream.outputs.short_sha }})
         uses: actions/checkout@v4
@@ -260,6 +260,23 @@ jobs:
 
       - name: Generate native iOS project (expo prebuild)
         run: npx expo prebuild --platform ios --no-install --clean
+
+      - name: Select Xcode & Accept License
+        run: |
+          XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode_26*.app" | sort -V | tail -n 1)
+          if [ -z "$XCODE_APP" ]; then
+            XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode*.app" | sort -V | tail -n 1)
+          fi
+          echo "Selected Xcode: $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR="$XCODE_APP/Contents/Developer"
+          sudo xcodebuild -license accept
+          xcodebuild -version
+
+          # Skip macro/plugin trust prompts
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
 
       - name: Configure Xcode Node environment (.xcode.env.local & Sentry bypass)
         run: |
@@ -282,22 +299,6 @@ jobs:
       - name: Install CocoaPods dependencies
         working-directory: ios
         run: pod install
-
-      - name: Select Xcode & Accept License
-        run: |
-          XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)
-          if [ -z "$XCODE_APP" ]; then
-            XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode*.app" | sort -V | tail -n 1)
-          fi
-          echo "Selected Xcode: $XCODE_APP"
-          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
-          echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
-          sudo xcodebuild -license accept
-          xcodebuild -version
-
-          # Skip macro/plugin trust prompts
-          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
-          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
 
       - name: Skip code signing & build .app
         timeout-minutes: 30
@@ -335,8 +336,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             DEVELOPMENT_TEAM="" \
             PROVISIONING_PROFILE_SPECIFIER="" \
-            -skipMacroValidation \
-            | (command -v xcbeautify >/dev/null 2>&1 && xcbeautify || cat)
+            -skipMacroValidation
 
           echo "✅ Build completed"
 
